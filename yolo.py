@@ -39,7 +39,7 @@ multi_tracking_enable = False
 optical_flow_enable = False
 arima_predict = True
 depthMapEstimation = True
-
+percentResize = 0.7
 
 class YOLO(object):
     def __init__(self):
@@ -325,6 +325,7 @@ def detect_video(yolo, video_path):
     yolo.close_session()
 
 def multi_tracking(yolo, video_path):
+    global percentResize
     accum_time = 0
     curr_fps = 0
     fps = "FPS: ??"
@@ -339,11 +340,23 @@ def multi_tracking(yolo, video_path):
         print('Failed to read video')
         exit()
     boxes = []
+
     frameCount = 1
     startFrame = 1
     skipFrames = 25
+    consecutiveframes = 1
+
+    initialHistoryCount = 11
+    skipHistory = 5
+
+    extrapolate = 3
+    dof = 0
+
+    yoloCount = 0
+    countCond = 0
     xhistory = []
     yhistory = []
+    depth_history = []
     while(True):
         if(frameCount == startFrame):
             frame = Image.fromarray(image)
@@ -373,15 +386,13 @@ def multi_tracking(yolo, video_path):
         xhistory.append([int(eachBox[0] + eachBox[2] / 2)])
         yhistory.append([int(eachBox[1] + eachBox[3] / 2)])
         ok = tracker.add(cv2.TrackerMedianFlow_create(), image, eachBox)
-    consecutiveframes = 1
-    yoloCount = 0
-    countCond = 0
-    predict_point = []
+
     while(True):
         ok, image=camera.read()
-        orig_image = image.copy()
         if not ok:
             break
+        orig_image = image.copy()
+
         if(prevBoxes != curBoxes):
             countCond += 1
         if(frameCount % skipFrames == 0):
@@ -400,7 +411,7 @@ def multi_tracking(yolo, video_path):
             curBoxes = None
             xhistory = []
             yhistory = []
-            predict_point = []
+            depth_history = []
             for eachBox in boxes:
                 eachBox = tuple(eachBox)
                 xhistory.append([int(eachBox[0] + eachBox[2] / 2)])
@@ -413,14 +424,14 @@ def multi_tracking(yolo, video_path):
         for i in range(len(boxes)):
             xhistory[i].append(int(boxes[i][0] + boxes[i][2] / 2))
             yhistory[i].append(int(boxes[i][1] + boxes[i][3] / 2))
-        if(arima_predict and len(xhistory[0]) > 11):
-            dof = 0
+        if(arima_predict and len(xhistory[0]) > initialHistoryCount):
+
             #if(len(xhistory[i]) > 27): dof = 5
             #print(xhistory[0])
-            extrapolate = 3
+
             for i in range(len(boxes)):
                 history = xhistory[i].copy()
-                history = [xhistory[i][t] for t in range(0, len(xhistory[i]), 5)]
+                history = [xhistory[i][t] for t in range(0, len(xhistory[i]), skipHistory)]
                 xmin = min(history)
                 history[:] = [x - xmin for x in history]
                 xmax = max(history)
@@ -435,7 +446,7 @@ def multi_tracking(yolo, video_path):
                 xhat = int((xoutput[0] * xmax) + xmin)
                 #xhat = xoutput[0]
                 history = yhistory[i].copy()
-                history = [yhistory[i][t] for t in range(0, len(yhistory[i]), 5)]
+                history = [yhistory[i][t] for t in range(0, len(yhistory[i]), skipHistory)]
                 ymin = min(history)
                 history[:] = [y - ymin for y in history]
                 #history = [yhistory[i][0], yhistory[i][int(len(yhistory[i]) / 2)], yhistory[i][len(yhistory[i]) - 1]]
@@ -450,8 +461,15 @@ def multi_tracking(yolo, video_path):
                     history.append(youtput[0])
                 yhat = int((youtput[0] * ymax) + ymin)
                 #yhat = youtput[0]
-                cv2.arrowedLine(image, (int(xhistory[i][0]),int(yhistory[i][0])), (int(boxes[i][0] + boxes[i][2] / 2), int(boxes[i][1] + boxes[i][3] / 2)), (0, 255, 0), 2)
-                cv2.arrowedLine(image, (int(boxes[i][0] + boxes[i][2] / 2), int(boxes[i][1] + boxes[i][3] / 2)), (xhat, yhat), (0, 0, 255), 2)
+                cp1 = int(boxes[i][0] + boxes[i][2] / 2)
+                cp2 = int(boxes[i][1] + boxes[i][3] / 2)
+                cv2.arrowedLine(image, (int(xhistory[i][0]),int(yhistory[i][0])), (cp1, cp2), (0, 255, 0), 2)
+                cv2.arrowedLine(image, (cp1, cp2), (xhat, yhat), (0, 0, 255), 2)
+                #slope = math.abs(math.atan((yhat - cp2) / (xhat - cp1)))
+                #speed = math.sqrt((yhat - cp2) * (yhat - cp2) + (xhat - cp1) * (xhat - cp1))
+                #percentChange = 0.0
+                #if(yhat >= cp2):
+
                 p1 = (int(xhat - boxes[i][2] / 2), int(yhat - boxes[i][3] / 2))
                 p2 = (int(xhat + boxes[i][2] / 2), int(yhat + boxes[i][3] / 2))
                 cv2.rectangle(image, p1, p2, (255, 255, 255), 1)
@@ -462,7 +480,58 @@ def multi_tracking(yolo, video_path):
 
         if(depthMapEstimation):
             depth_est = image_depth(orig_image)
-            cv2.imshow('depth', depth_est)
+            dof = 0
+            current_depth_est = depth_est.copy()
+            pred_depth_est = depth_est.copy()
+            pd = 'OFF'
+            for i in range(len(boxes)):
+                p1 = (int(boxes[i][0]), int(boxes[i][1]))
+                p2 = (int(boxes[i][0] + boxes[i][2]), int(boxes[i][1] + boxes[i][3]))
+                current_depth = cal_depth_box(depth_est, p1, p2)
+                if(len(depth_history) < len(boxes)):
+                    depth_history.append([current_depth])
+                else:
+                    depth_history[i].append(current_depth)
+                if(math.isnan(current_depth)):
+                    continue
+                if(len(depth_history[i]) > initialHistoryCount):
+                    pd = 'ON'
+                    history = depth_history[i].copy()
+                    hisotry = np.nan_to_num(history)
+                    history = [history[t] for t in range(0, len(history), skipHistory)]
+                    dmin = min(history)
+                    history[:] = [d - dmin for d in history]
+                    dmax = max(history)
+                    if(dmax == 0): dmax = 1
+                    history[:] = [d / dmax for d in history]
+                    for j in range(extrapolate):
+                        dmodel = ARIMA(history, order = (0, 1, 0))
+                        dmodel_fit = dmodel.fit(disp = 0, maxiter=200)
+                        doutput = dmodel_fit.forecast()
+                        history.append(doutput[0])
+                    #print(doutput[0])
+                    if(not math.isnan(doutput[0])):
+                        dhat = int((doutput[0] * dmax) + dmin)
+                    else:
+                        dhat = current_depth
+
+                    current_depth_est = set_depth(current_depth_est, p1, p2, current_depth)
+                    if(math.isnan(current_depth)):
+                        print("wtf just happened")
+                    cv2.putText(current_depth_est,text=str(int(current_depth)), org=(p1[0], p1[1]), fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+                                fontScale=0.50, color=(0, 0, 255), thickness=1)
+                    pred_depth_est = set_depth(pred_depth_est, p1, p2, dhat)
+                    cv2.putText(pred_depth_est,text=str(int(dhat)), org=(p1[0], p1[1]), fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+                                fontScale=0.50, color=(0, 0, 255), thickness=1)
+
+            cv2.putText(pred_depth_est, text=pd, org=(3, 15), fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+                        fontScale=0.50, color=(0, 0, 255), thickness=2)
+            #cv2.namedWindow("curdepth", cv2.WINDOW_NORMAL)
+            current_depth_est = cv2.resize(current_depth_est, (0,0), fx=percentResize, fy=percentResize)
+            cv2.imshow('curdepth', current_depth_est)
+            #cv2.namedWindow("predepth", cv2.WINDOW_NORMAL)
+            pred_depth_est = cv2.resize(pred_depth_est, (0,0), fx=percentResize, fy=percentResize)
+            cv2.imshow('predepth', pred_depth_est)
         curr_time = timer()
         exec_time = curr_time - prev_time
         prev_time = curr_time
@@ -474,6 +543,8 @@ def multi_tracking(yolo, video_path):
             curr_fps = 0
         cv2.putText(image, text=fps, org=(3, 15), fontFace=cv2.FONT_HERSHEY_SIMPLEX,
                     fontScale=0.50, color=(255, 0, 0), thickness=2)
+        #cv2.namedWindow("tracking", cv2.WINDOW_NORMAL)
+        image = cv2.resize(image, (0,0), fx=percentResize, fy=percentResize)
         cv2.imshow('tracking', image)
         frameCount += 1
         consecutiveframes += 1
@@ -503,7 +574,19 @@ def image_depth(image):
     result = Image.fromarray(np.uint8(cm.binary(disp_to_img)*255))
     result = result.convert("RGB")
     numpyResult = np.array(result)
+    numpyResult = cv2.cvtColor(numpyResult, cv2.COLOR_RGB2GRAY)
     return numpyResult
+
+def cal_depth_box(depth_est, p1, p2):
+    box_depth = depth_est[p1[1]:p2[1], p1[0]:p2[0]]
+    box_depth = np.nan_to_num(box_depth)
+    return box_depth.mean()
+
+def set_depth(depth_est, p1, p2, val):
+    crop_im = depth_est[p1[1]:p2[1], p1[0]:p2[0]]
+    crop_im.fill(val)
+    depth_est[p1[1]:p2[1], p1[0]:p2[0]] = crop_im
+    return depth_est
 # ==============================================================================
 
 
